@@ -1,0 +1,126 @@
+#!/usr/bin/python
+#
+# Summarizes generic_make_request() latency as a histogramm
+#
+# Copyright 2018 Aleksei Zakharov
+# Licensed under the Apache License, Version 2.0 (the "License")
+
+from __future__ import print_function
+from bcc import BPF
+import ctypes as ct
+from time import sleep,strftime
+import argparse
+
+examples = """examples:
+    ./make_request_lat       # summarize generic_make_request latency as a historgramm
+    ./make_request_lat 10 1  # summarize 10-seconds interval one time
+    ./make_request_lat -s -m # shows milliseconds histogramm for sync requests only
+"""
+
+parser = argparse.ArgumentParser(
+    description="Summarize generic_make_request() latency as a histogram",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument("interval", nargs="?", default=1,
+    help="output interval, seconds")
+parser.add_argument("count", nargs="?", default=99999999,
+    help="number of outputs")
+parser.add_argument("-s","--sync",action="store_true",
+    help="measure sync requests only")
+parser.add_argument("-m","--milliseconds",action="store_true",
+    help="milliseconds histogram")
+args = parser.parse_args()
+countdown = int(args.count)
+
+# load BPF program
+bpf_text="""
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+#include <linux/blkdev.h>
+#include <linux/blk_types.h>
+
+BPF_HASH(p, u64);
+BPF_HISTOGRAM(dist);
+
+struct data_t {
+    u64 pid;
+    u64 ts;
+    char comm[TASK_COMM_LEN];
+    u64 lat;
+};
+BPF_PERF_OUTPUT(events);
+
+void start(struct pt_regs *ctx, struct bio *bio) {
+    u64 ts = bpf_ktime_get_ns();
+    u64 pid = bpf_get_current_pid_tgid();
+    STORE
+}
+
+void end(struct pt_regs *ctx) {
+    struct data_t data = {};
+
+    data.pid = bpf_get_current_pid_tgid();
+    data.ts = bpf_ktime_get_ns();
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+    u64 *s_time = p.lookup(&data.pid);
+    if (s_time != 0) {
+        data.lat = (data.ts - *s_time) / 1000;
+        FACTOR
+	dist.increment(bpf_log2l(data.lat));
+        p.delete(&data.pid);
+    }
+
+}
+"""
+# define output data structure in Python
+TASK_COMM_LEN = 16    # linux/sched.h
+
+if args.milliseconds:
+    bpf_text = bpf_text.replace('FACTOR', 'data.lat /= 1000;')
+    label = "msecs"
+else:
+    bpf_text = bpf_text.replace('FACTOR','')
+    label = "usecs"
+
+if args.sync:
+    bpf_text = bpf_text.replace('STORE',
+            'if ( bio->bi_opf & (REQ_SYNC | REQ_FUA | REQ_PREFLUSH) ||' +
+            '    (bio->bi_opf & REQ_OP_MASK) == REQ_OP_READ) {' +
+            'p.update(&pid, &ts);' +
+            '}')
+else:
+    bpf_text = bpf_text.replace('STORE',
+            'p.update(&pid,&ts);')
+
+b = BPF(text=bpf_text)
+b.attach_kprobe(event="generic_make_request",fn_name="start")
+b.attach_kretprobe(event="generic_make_request",fn_name="end")
+print("Tracing generic_make_request latency... Ctrl-C to end")
+class Data(ct.Structure):
+    _fields_ = [("pid", ct.c_ulonglong),
+                ("ts", ct.c_ulonglong),
+                ("comm", ct.c_char * TASK_COMM_LEN),
+		("lat", ct.c_ulonglong)]
+
+def print_event(cpu, data, size):
+    global start
+    event = ct.cast(data, ct.POINTER(Data)).contents
+    if start == 0:
+            start = event.ts
+    time_s = (float(event.ts - start)) / 1000000000
+    print("%-18.9f %-16s %-6d %-1s ns" % (time_s, event.comm, event.pid, event.lat))
+
+dist = b.get_table("dist")
+exiting = 0 if args.interval else 1
+while 1:
+    try:
+	sleep(int(args.interval))
+    except KeyboardInterrupt:
+        exiting=1
+    print()
+    print("%-8s\n" % strftime("%H:%M:%S"), end="")
+    dist.print_log2_hist(label)
+    dist.clear()
+    if exiting or countdown == 0:
+        exit()

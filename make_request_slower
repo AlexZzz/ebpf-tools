@@ -1,0 +1,133 @@
+#!/usr/bin/python
+#
+# Shows generic_make_request() calls which were slower
+# than expected.
+#
+# Copyright 2018 Aleksei Zakharov
+# Licensed under the Apache License, Version 2.0 (the "License")
+
+from __future__ import print_function
+from bcc import BPF
+from time import sleep, strftime
+import ctypes as ct
+import argparse
+
+# arguments
+examples = """examples:
+    ./make_request_slower 100 -s    # Show only sync requests that were slower than 100usec
+    ./make_request_slower -m        # Show milliseconds latency
+"""
+parser = argparse.ArgumentParser(
+    description="Shows generic_make_request() calls slower than expected",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument("min_usec", nargs="?", default='1000',
+    help="minimum I/O duration to trace, in usec (default 1000)")
+parser.add_argument("-s","--sync",action="store_true",
+    help="measure sync requests only")
+parser.add_argument("-m","--milliseconds",action="store_true",
+    help="milliseconds histogram")
+
+args = parser.parse_args()
+min_usec = int(args.min_usec)
+
+# load BPF program
+bpf_text="""
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+#include <linux/bio.h>
+#include <linux/blkdev.h>
+#include <linux/blk_types.h>
+#include <linux/genhd.h>
+
+struct data_t {
+    u64 pid;
+    u64 ts;
+    char comm[TASK_COMM_LEN];
+    u64 lat;
+    char disk[DISK_NAME_LEN];
+};
+
+BPF_HASH(p, u64, struct data_t);
+
+BPF_PERF_OUTPUT(events);
+
+void start(struct pt_regs *ctx, struct bio *bio) {
+    u64 pid = bpf_get_current_pid_tgid();
+    struct data_t data = {};
+  FILTER_SYNC
+    u64 ts = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.ts = ts;
+// For linux<4.13
+//    bpf_probe_read_str(&data.disk, sizeof(data.disk), (void*)bio->bi_bdev->bd_disk->disk_name);
+// For linux>=4.13
+    bpf_probe_read_str(&data.disk, sizeof(data.disk), (void*)bio->bi_disk->disk_name);
+    p.update(&pid, &data);
+  FILTER_END
+}
+
+void stop(struct pt_regs *ctx) {
+    u64 pid = bpf_get_current_pid_tgid();
+    u64 ts = bpf_ktime_get_ns();
+    struct data_t* data = p.lookup(&pid);
+    if (data != 0 && data->ts > 0) {
+      bpf_get_current_comm(&data->comm, sizeof(data->comm));
+      data->lat = (ts - data->ts)/1000;
+      if (data->lat > MIN_US) {
+        FACTOR
+        data->pid >>= 32;
+        events.perf_submit(ctx, data, sizeof(struct data_t));
+      }
+    p.delete(&pid);
+    }
+}
+"""
+# define output data structure in Python
+TASK_COMM_LEN = 16    # linux/sched.h
+DISK_NAME_LEN = 32    # linux/genhd.h
+bpf_text = bpf_text.replace('MIN_US',str(min_usec))
+if args.sync:
+    bpf_text = bpf_text.replace('FILTER_SYNC',
+            'if ( bio->bi_opf & (REQ_SYNC | REQ_FUA | REQ_PREFLUSH) ||' +
+            '    (bio->bi_opf & REQ_OP_MASK) == REQ_OP_READ) {')
+    bpf_text = bpf_text.replace('FILTER_END','}')
+else:
+    bpf_text = bpf_text.replace('FILTER_SYNC','')
+    bpf_text = bpf_text.replace('FILTER_END','')
+
+if args.milliseconds:
+    bpf_text = bpf_text.replace('FACTOR','data->lat /= 1000;')
+    label = "msec"
+else:
+    bpf_text = bpf_text.replace('FACTOR','')
+    label = "usec"
+
+b = BPF(text=bpf_text)
+b.attach_kprobe(event="generic_make_request",fn_name="start")
+b.attach_kretprobe(event="generic_make_request",fn_name="stop")
+print("Tracing generic_make_request... Ctrl-C to end")
+class Data(ct.Structure):
+    _fields_ = [("pid", ct.c_ulonglong),
+                ("ts", ct.c_ulonglong),
+                ("comm", ct.c_char * TASK_COMM_LEN),
+		("lat", ct.c_ulonglong),
+                ("disk",ct.c_char * DISK_NAME_LEN)]
+
+
+def print_event(cpu, data, size):
+    global start
+    event = ct.cast(data, ct.POINTER(Data)).contents
+    if start == 0:
+            start = event.ts
+    time_s = (float(event.ts - start)) / 1000000000
+    print("%-18.9f %-16s %-6d   %-1s %s   %s" % (time_s, event.comm, event.pid, event.lat, label, event.disk))
+
+b["events"].open_perf_buffer(print_event)
+# format output
+start = 0
+while 1:
+  try:
+    b.perf_buffer_poll()
+  except KeyboardInterrupt:
+    exit()
