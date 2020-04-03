@@ -1,0 +1,109 @@
+#!/usr/bin/python
+
+# This tool prints EDAC reported errors.
+# It utilizes tracepoint ras:mc_event.
+#
+# Copyright 2020 Vladimir Shipilov, Aleksei Zakharov
+# Licensed under the Apacahe License, Version 2.0
+
+from __future__ import print_function
+from bcc import BPF
+from bcc.utils import printb
+import ctypes as ct
+from time import strftime
+
+# define BPF program
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <linux/types.h>
+
+// 100 is just enough. Actual size in include/linux/edac.h: struct edac_raw_error_desc
+#define STR_SIZE 100
+
+struct data_t {
+    unsigned short common_type;
+    unsigned char common_flags;
+    unsigned char common_preempt_count;
+    int common_pid;
+    unsigned int error_type;
+    int data_loc_msg;
+    int data_loc_label;
+    u16 error_count;
+    u8 mc_index;
+    s8 top_layer;
+    s8 middle_layer;
+    s8 lower_layer;
+    long address;
+    u8 grain_bits;
+    long syndrome;
+    int data_loc_driver_detail;
+
+    char error_msg[STR_SIZE];
+    char label[STR_SIZE];
+    char driver_detail[STR_SIZE];
+};
+
+
+BPF_PERF_OUTPUT(events);
+
+int trace_mc_events(struct data_t *args) {
+    struct data_t data = {
+        .error_type = args->error_type,
+        .error_count = args->error_count,
+        .mc_index = args->mc_index,
+        .top_layer = args->top_layer,
+        .middle_layer = args->middle_layer,
+        .lower_layer = args->lower_layer,
+        .address = args->address,
+        .grain_bits= args->grain_bits,
+        .syndrome = args->syndrome
+    };
+
+    TP_DATA_LOC_READ_CONST(data.error_msg,msg,STR_SIZE);
+    TP_DATA_LOC_READ_CONST(data.label,label,STR_SIZE);
+    TP_DATA_LOC_READ_CONST(data.driver_detail,driver_detail,STR_SIZE);
+
+    events.perf_submit(args, &data, sizeof(data));
+
+    return 0;
+}
+"""
+
+# load BPF program
+b = BPF(text=bpf_text)
+b.attach_tracepoint(tp="ras:mc_event", fn_name="trace_mc_events")
+
+# include/linux/edac.h
+hw_event_mc_err_type = {
+        0: "ERR_CORRECTED",
+        1: "ERR_UNCORRECTED",
+        2: "ERR_DEFERRED",
+        3: "ERR_FATAL",
+        4: "INFO"
+        }
+
+print("Tracing EDAC mc_event... Hit Ctrl-C to end.\n")
+
+def print_event(cpu, data, size):
+    event = b["events"].event(data)
+    printb(b"%s" % strftime("%H:%M:%S"))
+    printb(b"  error_type - %s" % hw_event_mc_err_type[event.error_type])
+    printb(b"  error_count - %d" % (event.error_count))
+    printb(b"  mc_index - %d" % (event.mc_index))
+    printb(b"  top_layer - %d" % (ct.cast(event.top_layer, ct.POINTER(ct.c_byte)).contents.value))
+    printb(b"  middle_layer - %d" % (ct.cast(event.middle_layer, ct.POINTER(ct.c_byte)).contents.value))
+    printb(b"  lower_layer - %d" % (ct.cast(event.lower_layer, ct.POINTER(ct.c_byte)).contents.value))
+    printb(b"  address - %ld" % (event.address))
+    printb(b"  grain_bits - %u" % (event.grain_bits))
+    printb(b"  syndrome - %ld" % (event.syndrome))
+    printb(b"  error_msg - %s" % (event.error_msg))
+    printb(b"  label - %s" % (event.label))
+    printb(b"  driver_detail - %s\n" % (event.driver_detail))
+
+# loop with callback to print_event
+b["events"].open_perf_buffer(print_event)
+while 1:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

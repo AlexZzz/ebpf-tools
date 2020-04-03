@@ -1,6 +1,9 @@
 # ebpf-tools
 This repo contains some eBPF-based tools for tracing.
 
+## tracemcevent
+This tool uses `ras:mc_event` tracepoint and prints EDAC errors.
+
 ## make_request_lat
 Summarizes `generic_make_request()` latency as a histogramm.
 
