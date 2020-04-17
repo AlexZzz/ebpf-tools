@@ -79,8 +79,8 @@ void stop(struct pt_regs *ctx) {
         data->pid >>= 32;
         events.perf_submit(ctx, data, sizeof(struct data_t));
       }
-    p.delete(&pid);
     }
+    p.delete(&pid);
 }
 """
 # define output data structure in Python
@@ -113,6 +113,7 @@ class Data(ct.Structure):
                 ("comm", ct.c_char * TASK_COMM_LEN),
 		("lat", ct.c_ulonglong),
                 ("disk",ct.c_char * DISK_NAME_LEN)]
+print("%-18.9s %-16s %-6s %-5s %s" % ("TIME", "COMM", "PID", "LAT"+"("+label+")", "DISK"))
 
 
 def print_event(cpu, data, size):
@@ -121,7 +122,7 @@ def print_event(cpu, data, size):
     if start == 0:
             start = event.ts
     time_s = (float(event.ts - start)) / 1000000000
-    print("%-18.9f %-16s %-6d   %-1s %s   %s" % (time_s, event.comm, event.pid, event.lat, label, event.disk))
+    print("%-18.9f %-16s %-6d %-5s %s" % (time_s, event.comm, event.pid, event.lat, event.disk))
 
 b["events"].open_perf_buffer(print_event)
 # format output
